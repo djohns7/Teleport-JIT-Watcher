@@ -49,7 +49,7 @@ GOOS=linux GOARCH=amd64 go build -o watcher-linux main.go
 
 **Direct deployment:**
 ```bash
-git clone <your-repo>
+git clone https://github.com/djohns7/Teleport-JIT-Watcher
 cd teleport-jit-watcher
 go build -o watcher main.go
 ```
