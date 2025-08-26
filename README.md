@@ -79,10 +79,6 @@ GOOS=linux GOARCH=amd64 go build -o watcher-linux main.go
 ./watcher -p your-teleport.example.com:443 -i /path/to/identity \
   -conflict-patterns=dev,staging,prod
 
-# Enforce separation between different team environments
-./watcher -p your-teleport.example.com:443 -i /path/to/identity \
-  -conflict-patterns=team-alpha,team-beta,team-gamma
-
 # Use patterns for region-based separation
 ./watcher -p your-teleport.example.com:443 -i /path/to/identity \
   -conflict-patterns=us-east,us-west,eu-central
