@@ -24,8 +24,9 @@ type Config struct {
 	MaxResources     int
 	CheckResources   bool
 	CheckConflicts   bool
-	Debug           bool
+	Debug            bool
 	PollInterval     time.Duration
+	ConflictPatterns []string  // Configurable patterns for role conflict checking
 }
 
 // Watcher manages the access request monitoring
@@ -33,8 +34,7 @@ type Watcher struct {
 	config          Config
 	client          *client.Client
 	lockedRequests  map[string]bool
-	prodPattern     *regexp.Regexp
-	researchPattern *regexp.Regexp
+	conflictPatterns []*regexp.Regexp  // Compiled regex patterns for conflict detection
 }
 
 // AccessRequestInfo holds parsed information about an access request
@@ -61,12 +61,21 @@ func NewWatcher(config Config) (*Watcher, error) {
 		return nil, fmt.Errorf("failed to create teleport client: %w", err)
 	}
 
+	// Compile conflict patterns
+	var conflictPatterns []*regexp.Regexp
+	for _, pattern := range config.ConflictPatterns {
+		re, err := regexp.Compile(`(?i)` + pattern)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compile pattern '%s': %w", pattern, err)
+		}
+		conflictPatterns = append(conflictPatterns, re)
+	}
+
 	return &Watcher{
 		config:          config,
 		client:          teleportClient,
 		lockedRequests:  make(map[string]bool),
-		prodPattern:     regexp.MustCompile(`(?i)prod`),
-		researchPattern: regexp.MustCompile(`(?i)research`),
+		conflictPatterns: conflictPatterns,
 	}, nil
 }
 
@@ -153,21 +162,23 @@ func (w *Watcher) countResources(info *AccessRequestInfo) int {
 	return len(info.Resources)
 }
 
-// hasEnvironmentConflict checks if roles contain both prod and research
-func (w *Watcher) hasEnvironmentConflict(roles []string) (bool, []string, []string) {
-	var prodRoles, researchRoles []string
-
+// hasEnvironmentConflict checks if roles contain conflicting patterns
+func (w *Watcher) hasEnvironmentConflict(roles []string) (bool, map[string][]string) {
+	// Map pattern to matching roles
+	matchingRoles := make(map[string][]string)
+	
 	for _, role := range roles {
-		if w.prodPattern.MatchString(role) {
-			prodRoles = append(prodRoles, role)
-		}
-		if w.researchPattern.MatchString(role) {
-			researchRoles = append(researchRoles, role)
+		for i, pattern := range w.conflictPatterns {
+			if pattern.MatchString(role) {
+				patternName := w.config.ConflictPatterns[i]
+				matchingRoles[patternName] = append(matchingRoles[patternName], role)
+			}
 		}
 	}
-
-	hasConflict := len(prodRoles) > 0 && len(researchRoles) > 0
-	return hasConflict, prodRoles, researchRoles
+	
+	// Check if multiple patterns matched (conflict)
+	hasConflict := len(matchingRoles) > 1
+	return hasConflict, matchingRoles
 }
 
 // approveAccessRequest approves a specific access request
@@ -203,6 +214,7 @@ func (w *Watcher) denyAccessRequest(ctx context.Context, requestID string, reaso
 
 	return nil
 }
+
 func (w *Watcher) lockAccessRequest(ctx context.Context, requestID string, reason string) error {
 	w.logDebug("Attempting to lock access request: %s", requestID)
 
@@ -259,7 +271,7 @@ func (w *Watcher) validateAndProcessPendingRequests(ctx context.Context, request
 
 		// Check policy violations
 		resourceCount := w.countResources(req)
-		hasConflict, prodRoles, researchRoles := w.hasEnvironmentConflict(req.Roles)
+		hasConflict, matchingRoles := w.hasEnvironmentConflict(req.Roles)
 
 		var shouldApprove = true
 		var denyReason string
@@ -274,7 +286,11 @@ func (w *Watcher) validateAndProcessPendingRequests(ctx context.Context, request
 		// Check environment conflicts
 		if w.config.CheckConflicts && hasConflict {
 			shouldApprove = false
-			denyReason = fmt.Sprintf("Request contains conflicting environments - prod roles: %v, research roles: %v", prodRoles, researchRoles)
+			var conflictDetails []string
+			for pattern, roles := range matchingRoles {
+				conflictDetails = append(conflictDetails, fmt.Sprintf("%s: %v", pattern, roles))
+			}
+			denyReason = fmt.Sprintf("Request contains conflicting environments - %s", strings.Join(conflictDetails, ", "))
 			w.logInfo("Request %s violates environment policy: %s", req.ID, denyReason)
 		}
 
@@ -305,6 +321,7 @@ func (w *Watcher) validateAndProcessPendingRequests(ctx context.Context, request
 
 	return processedRequests
 }
+
 // isRequestLocked checks if we've locked this request during this session
 func (w *Watcher) isRequestLocked(requestID string) bool {
 	return w.lockedRequests[requestID]
@@ -316,7 +333,7 @@ func (w *Watcher) hasSingleRequestEnvironmentConflict(req *AccessRequestInfo) bo
 		return false
 	}
 	
-	hasConflict, _, _ := w.hasEnvironmentConflict(req.Roles)
+	hasConflict, _ := w.hasEnvironmentConflict(req.Roles)
 	return hasConflict
 }
 
@@ -330,7 +347,7 @@ func (w *Watcher) hasRolePattern(roles []string, pattern *regexp.Regexp) bool {
 	return false
 }
 
-// processEnvironmentConflicts handles prod/research conflicts for a user
+// processEnvironmentConflicts handles conflicts for a user
 func (w *Watcher) processEnvironmentConflicts(ctx context.Context, userRequests []*AccessRequestInfo) []*AccessRequestInfo {
 	if !w.config.CheckConflicts {
 		return userRequests
@@ -343,13 +360,18 @@ func (w *Watcher) processEnvironmentConflicts(ctx context.Context, userRequests 
 	user := userRequests[0].User
 	w.logInfo("Checking environment conflicts for user %s", user)
 
-	// First, lock any single requests that have both prod and research roles
+	// First, lock any single requests that have conflicting roles
 	var requestsToProcess []*AccessRequestInfo
 	
 	for _, req := range userRequests {
 		if w.hasSingleRequestEnvironmentConflict(req) {
-			// This single request has both prod and research roles - lock it
-			reason := fmt.Sprintf("Single request contains both prod and research roles: %v", req.Roles)
+			// This single request has conflicting roles - lock it
+			_, matchingRoles := w.hasEnvironmentConflict(req.Roles)
+			var conflictDetails []string
+			for pattern, roles := range matchingRoles {
+				conflictDetails = append(conflictDetails, fmt.Sprintf("%s: %v", pattern, roles))
+			}
+			reason := fmt.Sprintf("Single request contains conflicting roles: %s", strings.Join(conflictDetails, ", "))
 			w.logInfo("Locking request %s: %s", req.ID, reason)
 			
 			if err := w.lockAccessRequest(ctx, req.ID, reason); err != nil {
@@ -376,22 +398,29 @@ func (w *Watcher) processEnvironmentConflicts(ctx context.Context, userRequests 
 	}
 
 	// Check for environment conflicts between requests
-	hasConflict, prodRoles, researchRoles := w.hasEnvironmentConflict(allRoles)
+	hasConflict, matchingRoles := w.hasEnvironmentConflict(allRoles)
 	if !hasConflict {
 		w.logDebug("No multi-request environment conflicts found for user %s", user)
 		return requestsToProcess
 	}
 
-	w.logInfo("User %s has multi-request environment conflict - prod roles: %v, research roles: %v",
-		user, prodRoles, researchRoles)
+	var conflictDetails []string
+	for pattern, roles := range matchingRoles {
+		conflictDetails = append(conflictDetails, fmt.Sprintf("%s: %v", pattern, roles))
+	}
+	w.logInfo("User %s has multi-request environment conflict - %s", user, strings.Join(conflictDetails, ", "))
 
 	// Identify requests with conflicting roles
 	var conflictRequests []*AccessRequestInfo
 	for _, req := range requestsToProcess {
-		hasProd := w.hasRolePattern(req.Roles, w.prodPattern)
-		hasResearch := w.hasRolePattern(req.Roles, w.researchPattern)
-
-		if hasProd || hasResearch {
+		hasMatch := false
+		for _, pattern := range w.conflictPatterns {
+			if w.hasRolePattern(req.Roles, pattern) {
+				hasMatch = true
+				break
+			}
+		}
+		if hasMatch {
 			conflictRequests = append(conflictRequests, req)
 		}
 	}
@@ -410,7 +439,8 @@ func (w *Watcher) processEnvironmentConflicts(ctx context.Context, userRequests 
 			if w.isRequestLocked(req.ID) {
 				w.logInfo("Request %s already locked", req.ID)
 			} else {
-				reason := "Multi-request environment conflict: user has both prod and research access across requests"
+				reason := fmt.Sprintf("Multi-request environment conflict: user has conflicting access across requests (%s)", 
+					strings.Join(w.config.ConflictPatterns, " vs "))
 				w.logInfo("Locking request %s (created: %s, roles: %v)",
 					req.ID, req.Created.Format(time.RFC3339), req.Roles)
 
@@ -562,7 +592,8 @@ func (w *Watcher) Watch(ctx context.Context) error {
 
 	policies := []string{}
 	if w.config.CheckConflicts {
-		policies = append(policies, "environment conflicts")
+		conflictDesc := fmt.Sprintf("environment conflicts (patterns: %s)", strings.Join(w.config.ConflictPatterns, ", "))
+		policies = append(policies, conflictDesc)
 	}
 	if w.config.CheckResources {
 		policies = append(policies, fmt.Sprintf("resource limit (%d)", w.config.MaxResources))
@@ -601,14 +632,36 @@ func (w *Watcher) Watch(ctx context.Context) error {
 	}
 }
 
+// StringSliceFlag is a custom flag type for accepting multiple string values
+type StringSliceFlag []string
+
+func (s *StringSliceFlag) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *StringSliceFlag) Set(value string) error {
+	// Split by comma and trim spaces
+	parts := strings.Split(value, ",")
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			*s = append(*s, trimmed)
+		}
+	}
+	return nil
+}
+
 func main() {
 	// Parse command line flags
 	var config Config
+	var conflictPatterns StringSliceFlag
+	
 	flag.StringVar(&config.AuthServer, "p", "", "Teleport auth service (required, e.g., danjdemo.teleport.sh:443)")
 	flag.StringVar(&config.IdentityFile, "i", "", "Path to Teleport identity file (required)")
 	flag.IntVar(&config.MaxResources, "m", 3, "Maximum approved resources per user")
 	flag.BoolVar(&config.CheckResources, "resource-limit", true, "Enable resource limit checking")
-	flag.BoolVar(&config.CheckConflicts, "role-conflicts", true, "Enable prod/research role conflict checking")
+	flag.BoolVar(&config.CheckConflicts, "role-conflicts", true, "Enable role conflict checking")
+	flag.Var(&conflictPatterns, "conflict-patterns", "Comma-separated patterns for conflict detection (default: prod,research)")
 	flag.DurationVar(&config.PollInterval, "poll-interval", 30*time.Second, "How often to check for policy violations")
 	flag.BoolVar(&config.Debug, "d", false, "Enable debug output")
 
@@ -617,21 +670,29 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Teleport JIT Access Request Watcher - Polling-based monitoring and policy enforcement\n\n")
 		fmt.Fprintf(os.Stderr, "Required arguments:\n")
 		fmt.Fprintf(os.Stderr, "  -p string\n")
-		fmt.Fprintf(os.Stderr, "        Teleport auth service (e.g., danjdemo.teleport.sh:443)\n")
+		fmt.Fprintf(os.Stderr, "        Teleport auth service (e.g., example.teleport.sh:443)\n")
 		fmt.Fprintf(os.Stderr, "  -i string\n")
 		fmt.Fprintf(os.Stderr, "        Path to Teleport identity file\n\n")
 		fmt.Fprintf(os.Stderr, "Optional arguments:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  # Run with both policies (default, check every 30s)\n")
-		fmt.Fprintf(os.Stderr, "  %s -p danjdemo.teleport.sh:443 -i ./identity\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # Run with default patterns (prod, research) checking every 30s\n")
+		fmt.Fprintf(os.Stderr, "  %s -p example.teleport.sh:443 -i ./identity\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # Use custom conflict patterns (dev, staging, prod)\n")
+		fmt.Fprintf(os.Stderr, "  %s -p example.teleport.sh:443 -i ./identity -conflict-patterns=dev,staging,prod\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  # Check every 10 seconds with debug output\n")
-		fmt.Fprintf(os.Stderr, "  %s -p danjdemo.teleport.sh:443 -i ./identity -poll-interval=10s -d\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # Run only environment conflict checking\n")
-		fmt.Fprintf(os.Stderr, "  %s -p danjdemo.teleport.sh:443 -i ./identity -resource-limit=false\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -p example.teleport.sh:443 -i ./identity -poll-interval=10s -d\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # Run only environment conflict checking with custom patterns\n")
+		fmt.Fprintf(os.Stderr, "  %s -p example.teleport.sh:443 -i ./identity -resource-limit=false -conflict-patterns=test,prod\n", os.Args[0])
 	}
 
 	flag.Parse()
+
+	// Set default conflict patterns if none provided
+	if len(conflictPatterns) == 0 {
+		conflictPatterns = []string{"prod", "research"}
+	}
+	config.ConflictPatterns = conflictPatterns
 
 	// Validate required arguments
 	if config.AuthServer == "" {
@@ -659,6 +720,11 @@ func main() {
 	// Validate poll interval
 	if config.PollInterval < time.Second {
 		log.Fatalf("Poll interval must be at least 1 second, got: %s", config.PollInterval)
+	}
+
+	// Validate conflict patterns
+	if config.CheckConflicts && len(config.ConflictPatterns) < 2 {
+		log.Fatalf("Role conflict checking requires at least 2 patterns, got: %v", config.ConflictPatterns)
 	}
 
 	// Create watcher
