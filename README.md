@@ -72,18 +72,6 @@ GOOS=linux GOARCH=amd64 go build -o watcher-linux main.go
 ./watcher -p your-teleport.example.com:443 -i /path/to/identity -poll-interval=10s
 ```
 
-### Custom Conflict Patterns
-
-```bash
-# Use custom patterns for dev/staging/prod separation
-./watcher -p your-teleport.example.com:443 -i /path/to/identity \
-  -conflict-patterns=dev,staging,prod
-
-# Use patterns for region-based separation
-./watcher -p your-teleport.example.com:443 -i /path/to/identity \
-  -conflict-patterns=us-east,us-west,eu-central
-```
-
 ### Policy Configuration
 
 ```bash
@@ -123,14 +111,6 @@ GOOS=linux GOARCH=amd64 go build -o watcher-linux main.go
 # Prevent users from having both production and development access
 ./watcher -p teleport.company.com:443 -i ./identity \
   -conflict-patterns=prod,dev
-```
-
-### Multi-Environment Setup
-```bash
-# Enforce separation between test, staging, and production
-./watcher -p teleport.company.com:443 -i ./identity \
-  -conflict-patterns=test,staging,production \
-  -m=5
 ```
 
 ### Team-Based Access Control
