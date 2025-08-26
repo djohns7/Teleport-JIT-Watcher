@@ -5,41 +5,51 @@ An automated policy enforcement system for Teleport Just-in-Time access requests
 ## Features
 
 - **Auto-approval**: Automatically approves compliant access requests
-- **Real-time enforcement**: Configurable polling for near real-time policy enforcement  
-- **Environment separation**: Prevents users from having both production and research access
+- **Real-time enforcement**: Configurable polling for near real-time policy enforcement
+- **Environment separation**: Prevents users from having conflicting role patterns (configurable)
 - **Resource limits**: Enforces maximum number of approved resources per user
 - **Smart locking**: Locks older requests when policies are violated
 - **Comprehensive logging**: Debug output shows policy decisions and enforcement actions
 
-## Policies Enforced
+## Policy Enforcement
 
-### 1. Resource Limit Policy
-Users can have a maximum of 3 approved resources at any time. When this limit is exceeded, older requests are locked while the newest requests remain active.
+### Resource Limits
+Users can have a maximum number of approved resources at any time (default: 3). When this limit is exceeded, older requests are locked while the newest requests remain active.
 
-### 2. Environment Conflict Policy
-Users cannot have both production and research access simultaneously. The system detects conflicts by matching "prod" and "research" patterns in role names. Single requests containing both environment types are automatically denied, while multi-request conflicts result in older requests being locked.
+### Role Conflict Detection
+Users cannot have roles matching conflicting patterns simultaneously. The system detects conflicts by matching configurable patterns in role names (default: `prod` and `research`).
 
-## Installation
+- Single requests containing roles matching multiple conflict patterns are automatically denied
+- Multi-request conflicts result in older requests being locked
+- Patterns are case-insensitive and support partial matching
 
-### Prerequisites
+## Requirements
+
 - Go 1.21 or later
 - Teleport Machine ID identity with appropriate permissions
 - Access to Teleport Auth API
 
-### Required Teleport Permissions
+### Required Permissions
+
 Your Machine ID identity requires these permissions:
+
 ```yaml
 rules:
-- resources: ['access_request']
-  verbs: ['list', 'read', 'update']
-- resources: ['lock']  
-  verbs: ['create', 'read', 'update', 'delete']
+  - resources: ['access_request']
+    verbs: ['list', 'read', 'update']
+  - resources: ['lock']
+    verbs: ['create', 'read', 'update', 'delete']
 ```
 
-### Build and Deploy
+## Installation
 
-**Build locally and deploy:**
+### Build from source
+
 ```bash
+# Clone the repository
+git clone https://github.com/djohns7/Teleport-JIT-Watcher
+cd Teleport-JIT-Watcher
+
 # Build for your platform
 go build -o watcher main.go
 
@@ -47,18 +57,12 @@ go build -o watcher main.go
 GOOS=linux GOARCH=amd64 go build -o watcher-linux main.go
 ```
 
-**Direct deployment:**
-```bash
-git clone https://github.com/djohns7/Teleport-JIT-Watcher
-cd Teleport-JIT-Watcher
-go build -o watcher main.go
-```
-
 ## Usage
 
 ### Basic Usage
+
 ```bash
-# Run with default settings (checks every 30s, max 3 resources)
+# Run with default settings (checks every 30s, max 3 resources, prod/research patterns)
 ./watcher -p your-teleport.example.com:443 -i /path/to/identity
 
 # Enable debug output
@@ -68,13 +72,92 @@ go build -o watcher main.go
 ./watcher -p your-teleport.example.com:443 -i /path/to/identity -poll-interval=10s
 ```
 
-### Configuration Options
+### Custom Conflict Patterns
+
 ```bash
--p, --proxy           Teleport auth service address (required)
--i, --identity-file   Path to Machine ID identity file (required)
--m, --max-resources   Maximum resources per user (default: 3)
---poll-interval       How often to check for violations (default: 30s)
---resource-limit      Enable/disable resource limit checking (default: true)
---role-conflicts      Enable/disable environment conflict checking (default: true)
--d, --debug           Enable debug output
+# Use custom patterns for dev/staging/prod separation
+./watcher -p your-teleport.example.com:443 -i /path/to/identity \
+  -conflict-patterns=dev,staging,prod
+
+# Enforce separation between different team environments
+./watcher -p your-teleport.example.com:443 -i /path/to/identity \
+  -conflict-patterns=team-alpha,team-beta,team-gamma
+
+# Use patterns for region-based separation
+./watcher -p your-teleport.example.com:443 -i /path/to/identity \
+  -conflict-patterns=us-east,us-west,eu-central
 ```
+
+### Policy Configuration
+
+```bash
+# Only check resource limits (disable conflict checking)
+./watcher -p your-teleport.example.com:443 -i /path/to/identity \
+  -role-conflicts=false -m=5
+
+# Only check role conflicts (disable resource limits)
+./watcher -p your-teleport.example.com:443 -i /path/to/identity \
+  -resource-limit=false -conflict-patterns=prod,dev,test
+
+# Custom configuration with all options
+./watcher -p your-teleport.example.com:443 -i /path/to/identity \
+  -conflict-patterns=production,development \
+  -m=10 \
+  -poll-interval=5s \
+  -d
+```
+
+## Command Line Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-p, --proxy` | Teleport auth service address (required) | - |
+| `-i, --identity-file` | Path to Machine ID identity file (required) | - |
+| `-m, --max-resources` | Maximum resources per user | `3` |
+| `--conflict-patterns` | Comma-separated patterns for role conflict detection | `prod,research` |
+| `--poll-interval` | How often to check for violations | `30s` |
+| `--resource-limit` | Enable/disable resource limit checking | `true` |
+| `--role-conflicts` | Enable/disable role conflict checking | `true` |
+| `-d, --debug` | Enable debug output | `false` |
+
+## Examples
+
+### Production/Development Separation
+```bash
+# Prevent users from having both production and development access
+./watcher -p teleport.company.com:443 -i ./identity \
+  -conflict-patterns=prod,dev
+```
+
+### Multi-Environment Setup
+```bash
+# Enforce separation between test, staging, and production
+./watcher -p teleport.company.com:443 -i ./identity \
+  -conflict-patterns=test,staging,production \
+  -m=5
+```
+
+### Team-Based Access Control
+```bash
+# Prevent cross-team access conflicts
+./watcher -p teleport.company.com:443 -i ./identity \
+  -conflict-patterns="team-infrastructure,team-application,team-security"
+```
+
+### Regional Separation
+```bash
+# Enforce geographic access boundaries
+./watcher -p teleport.company.com:443 -i ./identity \
+  -conflict-patterns="region-us,region-eu,region-apac" \
+  -poll-interval=15s
+```
+
+## How It Works
+
+1. **Monitoring**: The watcher polls Teleport at regular intervals for access requests
+2. **Auto-Approval**: Pending requests that comply with all policies are automatically approved
+3. **Auto-Denial**: Pending requests that violate policies are automatically denied with a reason
+4. **Conflict Detection**: Checks if users have roles matching multiple conflict patterns
+5. **Resource Counting**: Tracks total approved resources per user
+6. **Smart Locking**: When violations are detected, older requests are locked while newer ones remain active
+7. **Logging**: All actions are logged with details about policy decisions and enforcement actions

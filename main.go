@@ -656,7 +656,7 @@ func main() {
 	var config Config
 	var conflictPatterns StringSliceFlag
 	
-	flag.StringVar(&config.AuthServer, "p", "", "Teleport auth service (required, e.g., danjdemo.teleport.sh:443)")
+	flag.StringVar(&config.AuthServer, "p", "", "Teleport auth service (required, e.g., example.teleport.sh:443)")
 	flag.StringVar(&config.IdentityFile, "i", "", "Path to Teleport identity file (required)")
 	flag.IntVar(&config.MaxResources, "m", 3, "Maximum approved resources per user")
 	flag.BoolVar(&config.CheckResources, "resource-limit", true, "Enable resource limit checking")
